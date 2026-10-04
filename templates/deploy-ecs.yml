@@ -1,0 +1,146 @@
+# templates/deploy-ecs.yml - reused for dev, staging and prod
+parameters:
+  - name: envName
+    type: string
+  - name: adoEnvironment
+    type: string
+  - name: awsConnection
+    type: string
+  - name: dependsOn
+    type: string
+  - name: runDast
+    type: boolean
+    default: false
+  - name: flagGate
+    type: boolean
+    default: false
+
+stages:
+  # ------------------------------------------------------------ PLAN
+  - stage: Plan_${{ parameters.envName }}
+    displayName: Plan infra (${{ parameters.envName }})
+    dependsOn: ${{ parameters.dependsOn }}
+    condition: and(succeeded(), eq(variables.isMain, 'true'))
+    variables:
+      - group: fin-${{ parameters.envName }}   # TF_STATE_BUCKET, TF_LOCK_TABLE
+    jobs:
+      - job: Plan
+        steps:
+          - script: bash scripts/install-terraform.sh $(tfVersion)
+            displayName: Install Terraform
+
+          - task: AWSShellScript@1
+            displayName: terraform plan (network, ALB, ECS) + WAF/AppConfig change set
+            inputs:
+              awsCredentials: ${{ parameters.awsConnection }}
+              regionName: $(AWS_REGION)
+              scriptType: filePath
+              filePath: scripts/plan-infra.sh
+              arguments: >-
+                ${{ parameters.envName }} $(Build.BuildId) $(Build.ArtifactStagingDirectory)
+                $(ecrRegistry) $(imageTag)
+
+          - publish: $(Build.ArtifactStagingDirectory)/plan
+            artifact: plan-${{ parameters.envName }}
+
+  # ---------------------------------------------------------- DEPLOY
+  - stage: Deploy_${{ parameters.envName }}
+    displayName: Deploy (${{ parameters.envName }})
+    dependsOn: Plan_${{ parameters.envName }}
+    variables:
+      - group: fin-${{ parameters.envName }}
+    jobs:
+      - deployment: Release
+        displayName: Apply infra + ECS rolling deploy (flag OFF)
+        environment: ${{ parameters.adoEnvironment }}
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - download: current
+                  artifact: plan-${{ parameters.envName }}
+
+                - script: bash scripts/install-terraform.sh $(tfVersion)
+                  displayName: Install Terraform
+
+                - task: AWSShellScript@1
+                  name: infra
+                  displayName: Apply Terraform plan + execute WAF/AppConfig change set
+                  inputs:
+                    awsCredentials: ${{ parameters.awsConnection }}
+                    regionName: $(AWS_REGION)
+                    scriptType: filePath
+                    filePath: scripts/apply-infra.sh
+                    arguments: >-
+                      ${{ parameters.envName }} $(Build.BuildId)
+                      $(Pipeline.Workspace)/plan-${{ parameters.envName }}
+
+                - task: AWSShellScript@1
+                  displayName: Deploy new task definitions (circuit breaker on)
+                  inputs:
+                    awsCredentials: ${{ parameters.awsConnection }}
+                    regionName: $(AWS_REGION)
+                    scriptType: filePath
+                    filePath: scripts/ecs-deploy.sh
+                    arguments: ${{ parameters.envName }} $(ecrRegistry) $(imageTag)
+
+                - script: bash scripts/smoke-test.sh "$(APP_URL)" "$(imageTag)"
+                  displayName: Post-deployment checks (health, version, payment round trip)
+
+                - ${{ if eq(parameters.runDast, true) }}:
+                    - script: |
+                        set -euo pipefail
+                        mkdir -p "$PWD/zap" && chmod 777 "$PWD/zap"
+                        docker run --rm -v "$PWD/zap:/zap/wrk" ghcr.io/zaproxy/zaproxy:stable \
+                          zap-baseline.py -t "$(APP_URL)" -c zap-rules.conf -r zap.html
+                      displayName: DAST - OWASP ZAP baseline
+                    - publish: zap
+                      artifact: zap-report
+                      condition: succeededOrFailed()
+          on:
+            failure:
+              steps:
+                - checkout: self
+                - task: AWSShellScript@1
+                  displayName: Roll back services to the previous image
+                  inputs:
+                    awsCredentials: ${{ parameters.awsConnection }}
+                    regionName: $(AWS_REGION)
+                    scriptType: filePath
+                    filePath: scripts/rollback.sh
+                    arguments: ${{ parameters.envName }}
+
+  # ------------------------------------------- FEATURE FLAG ROLLOUT
+  - stage: Flags_${{ parameters.envName }}
+    displayName: Feature flag rollout (${{ parameters.envName }})
+    dependsOn: Deploy_${{ parameters.envName }}
+    variables:
+      - group: fin-${{ parameters.envName }}
+    jobs:
+      - ${{ if eq(parameters.flagGate, true) }}:
+          - job: FlagApproval
+            displayName: Approve enabling new payment flow
+            pool: server            # agentless job
+            timeoutInMinutes: 1440
+            steps:
+              - task: ManualValidation@0
+                inputs:
+                  notifyUsers: '[fin]\Release Approvers'
+                  instructions: >-
+                    Code is live in prod with the flag OFF. Check the CloudWatch
+                    dashboard, then approve to start the gradual AppConfig rollout.
+                  onTimeout: reject
+
+      - job: Rollout
+        displayName: AppConfig gradual deployment (alarm-guarded)
+        ${{ if eq(parameters.flagGate, true) }}:
+          dependsOn: FlagApproval
+        steps:
+          - task: AWSShellScript@1
+            inputs:
+              awsCredentials: ${{ parameters.awsConnection }}
+              regionName: $(AWS_REGION)
+              scriptType: filePath
+              filePath: scripts/flag-rollout.sh
+              arguments: ${{ parameters.envName }} flags/${{ parameters.envName }}.json

@@ -1,0 +1,4 @@
+[
+  { "ParameterKey": "Env", "ParameterValue": "staging" },
+  { "ParameterKey": "FlagRolloutMinutes", "ParameterValue": "5" }
+]

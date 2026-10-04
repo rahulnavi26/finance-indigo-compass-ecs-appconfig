@@ -1,0 +1,5 @@
+[
+  { "ParameterKey": "Env", "ParameterValue": "prod" },
+  { "ParameterKey": "FlagRolloutMinutes", "ParameterValue": "30" },
+  { "ParameterKey": "RollbackErrorThreshold", "ParameterValue": "10" }
+]

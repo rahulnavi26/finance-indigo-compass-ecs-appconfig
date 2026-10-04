@@ -1,0 +1,143 @@
+# azure-pipelines.yml
+# Finance Indigo Compass Delivery Platform
+# Azure Pipelines -> Amazon ECS on Fargate, ECR, Terraform + CloudFormation,
+# AWS AppConfig feature flags, AWS WAF, CloudWatch
+
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  - group: fin-common              # AWS_REGION, ECR_ACCOUNT_ID
+  - name: ciConnection
+    value: aws-fin-tools
+  - name: imageTag
+    value: build-$(Build.BuildId)
+  - name: ecrRegistry
+    value: $(ECR_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com
+  - name: isMain
+    value: $[eq(variables['Build.SourceBranch'], 'refs/heads/main')]
+  - name: tfVersion
+    value: '1.9.8'
+
+stages:
+  # ===================================================================== CI
+  - stage: CI
+    displayName: Tests + security tests
+    jobs:
+      - job: Test
+        displayName: Unit tests, SAST, dependency audit
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: '3.12'
+
+          - script: |
+              set -euo pipefail
+              python -m pip install --upgrade pip
+              pip install -r requirements-dev.txt   # pytest, pytest-cov, httpx, semgrep, pip-audit
+              for svc in payment-service reconciliation-service; do
+                pip install -r services/$svc/requirements.txt
+              done
+            displayName: Install dependencies
+
+          - script: |
+              set -euo pipefail
+              pytest services/ --junitxml=test-results/unit.xml \
+                --cov=services --cov-report=xml:coverage.xml --cov-fail-under=80
+            displayName: Unit tests (coverage gate 80%)
+
+          - script: |
+              set -euo pipefail
+              semgrep scan --config p/python --config p/secrets \
+                --error --junit-xml --output test-results/semgrep.xml services/
+            displayName: SAST (Semgrep)
+
+          - script: |
+              set -euo pipefail
+              for svc in payment-service reconciliation-service; do
+                pip-audit -r services/$svc/requirements.txt --strict
+              done
+            displayName: Dependency audit (pip-audit)
+
+          - task: PublishTestResults@2
+            condition: succeededOrFailed()
+            inputs:
+              testResultsFormat: JUnit
+              testResultsFiles: 'test-results/*.xml'
+              testRunTitle: 'Finance unit + SAST'
+
+          - task: PublishCodeCoverageResults@2
+            condition: succeededOrFailed()
+            inputs:
+              summaryFileLocation: coverage.xml
+
+      - job: Image
+        displayName: Build, scan, push
+        dependsOn: Test
+        strategy:
+          matrix:
+            payment:
+              service: payment-service
+            reconciliation:
+              service: reconciliation-service
+        steps:
+          - script: |
+              set -euo pipefail
+              docker build -t $(ecrRegistry)/fin/$(service):$(imageTag) services/$(service)
+              docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                aquasec/trivy:0.56.2 image --exit-code 1 --severity HIGH,CRITICAL \
+                --ignore-unfixed $(ecrRegistry)/fin/$(service):$(imageTag)
+            displayName: Build + image scan $(service)
+
+          - task: AWSShellScript@1
+            displayName: Push to ECR (main only)
+            condition: and(succeeded(), eq(variables.isMain, 'true'))
+            inputs:
+              awsCredentials: ${{ variables.ciConnection }}
+              regionName: $(AWS_REGION)
+              scriptType: inline
+              inlineScript: |
+                set -euo pipefail
+                aws ecr get-login-password \
+                  | docker login --username AWS --password-stdin $(ecrRegistry)
+                docker push $(ecrRegistry)/fin/$(service):$(imageTag)
+
+  # ============================================================ DEPLOYMENTS
+  - template: templates/deploy-ecs.yml
+    parameters:
+      envName: dev
+      adoEnvironment: fin-dev
+      awsConnection: aws-fin-dev
+      dependsOn: CI
+      runDast: false
+      flagGate: false
+
+  - template: templates/deploy-ecs.yml
+    parameters:
+      envName: staging
+      adoEnvironment: fin-staging
+      awsConnection: aws-fin-staging
+      dependsOn: Deploy_dev
+      runDast: true            # OWASP ZAP baseline against staging
+      flagGate: false
+
+  - template: templates/deploy-ecs.yml
+    parameters:
+      envName: prod
+      adoEnvironment: fin-prod # approval gate #1 (environment approvals)
+      awsConnection: aws-fin-prod
+      dependsOn: Deploy_staging
+      runDast: false
+      flagGate: true           # approval gate #2 before enabling the feature flag

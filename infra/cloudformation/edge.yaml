@@ -1,0 +1,152 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Edge protection (AWS WAF) and feature flags (AWS AppConfig) for Finance Indigo Compass
+
+Parameters:
+  Env:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+  AlbArn:
+    Type: String
+    Description: ARN of the ALB created by Terraform (WAF is attached to it)
+  AlbArnSuffix:
+    Type: String
+    Description: ALB identifier used by CloudWatch, for example app/fin-dev-alb/50dc6c495c0c9188
+  RateLimitPer5Min:
+    Type: Number
+    Default: 1000
+    Description: Requests allowed per IP in five minutes before WAF blocks
+  RollbackErrorThreshold:
+    Type: Number
+    Default: 10
+    Description: ALB target 5xx responses per minute that make AppConfig roll the flag back
+  FlagRolloutMinutes:
+    Type: Number
+    Default: 30
+
+Resources:
+  # ------------------------------------------------------------ WAF
+  WebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "fin-${Env}-waf"
+      Scope: REGIONAL
+      DefaultAction: { Allow: {} }
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "fin-${Env}-waf"
+      Rules:
+        - Name: AWSCommon
+          Priority: 0
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesCommonRuleSet }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: common
+        - Name: KnownBadInputs
+          Priority: 1
+          OverrideAction: { None: {} }
+          Statement:
+            ManagedRuleGroupStatement: { VendorName: AWS, Name: AWSManagedRulesKnownBadInputsRuleSet }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: badinputs
+        - Name: RateLimitPerIp
+          Priority: 2
+          Action: { Block: {} }
+          Statement:
+            RateBasedStatement: { Limit: !Ref RateLimitPer5Min, AggregateKeyType: IP }
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: ratelimit
+
+  WebAclAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref AlbArn
+      WebACLArn: !GetAtt WebAcl.Arn
+
+  # ------------------------------------------------- AppConfig feature flags
+  FlagsApplication:
+    Type: AWS::AppConfig::Application
+    Properties:
+      Name: !Sub "fin-${Env}"
+
+  FlagsProfile:
+    Type: AWS::AppConfig::ConfigurationProfile
+    Properties:
+      ApplicationId: !Ref FlagsApplication
+      Name: flags
+      LocationUri: hosted
+      Type: AWS.Freeform
+
+  # AppConfig watches this alarm during a rollout and rolls the flag back if it fires
+  RollbackAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "fin-${Env}-flag-rollback-5xx"
+      AlarmDescription: ALB target 5xx responses; reverts an in-progress flag rollout
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref AlbArnSuffix
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: !Ref RollbackErrorThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  AppConfigMonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: appconfig.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: read-alarms
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudwatch:DescribeAlarms
+                Resource: '*'
+
+  FlagsEnvironment:
+    Type: AWS::AppConfig::Environment
+    Properties:
+      ApplicationId: !Ref FlagsApplication
+      Name: !Ref Env
+      Monitors:
+        - AlarmArn: !GetAtt RollbackAlarm.Arn
+          AlarmRoleArn: !GetAtt AppConfigMonitorRole.Arn
+
+  GradualStrategy:
+    Type: AWS::AppConfig::DeploymentStrategy
+    Properties:
+      Name: !Sub "fin-${Env}-gradual"
+      DeploymentDurationInMinutes: !Ref FlagRolloutMinutes
+      GrowthFactor: 20
+      GrowthType: LINEAR
+      FinalBakeTimeInMinutes: 5
+      ReplicateTo: NONE
+
+Outputs:
+  AppConfigAppId:
+    Value: !Ref FlagsApplication
+  FlagsProfileId:
+    Value: !Ref FlagsProfile
+  AppConfigEnvId:
+    Value: !Ref FlagsEnvironment
+  GradualStrategyId:
+    Value: !Ref GradualStrategy
+  WebAclArn:
+    Value: !GetAtt WebAcl.Arn
